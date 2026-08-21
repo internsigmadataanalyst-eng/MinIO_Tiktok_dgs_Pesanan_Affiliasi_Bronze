@@ -84,6 +84,10 @@ def build_bronze_affiliate(
     # buang baris tanpa id
     df = df[df["id_pesanan"].astype(str).str.strip() != ""]
 
+    # tidak ada data valid → biarkan pipeline memberi tahu "up-to-date"
+    if df.empty:
+        return df, {}
+
     # snapshot fields
     now_utc = datetime.now(timezone.utc)
     df["snapshot_ts"] = now_utc

@@ -68,17 +68,16 @@ def test_merge_to_silver_duckdb(df_bronze: pd.DataFrame):
     con = duckdb.connect(":memory:")
     con.sql("INSTALL bigquery FROM community; LOAD bigquery;")
 
-    # 2. Setup Bronze
-    con.sql("CREATE SCHEMA IF NOT EXISTS BRONZE_DB;")
-    con.sql("CREATE TABLE BRONZE_DB.bronze_affiliate AS SELECT * FROM df_bronze")
-    print("[BRONZE] Load to BRONZE_DB.bronze_affiliate DONE")
+    # 2. Setup Bronze (pakai schema 'Testing' agar sama dengan SQL produksi)
+    con.sql("CREATE SCHEMA IF NOT EXISTS Testing;")
+    con.sql("CREATE TABLE Testing.bronze_affiliate AS SELECT * FROM df_bronze")
+    print("[BRONZE] Load to Testing.bronze_affiliate DONE")
     print("Show Sampel Data bronze_affiliate:")
-    con.sql("SELECT * FROM BRONZE_DB.bronze_affiliate LIMIT 3").show()
+    con.sql("SELECT * FROM Testing.bronze_affiliate LIMIT 3").show()
 
     # 3. Setup Silver Schema & Macro
-    con.sql("CREATE SCHEMA IF NOT EXISTS SILVER_DB;")
     con.sql("""
-        CREATE TABLE IF NOT EXISTS SILVER_DB.silver_tt_affiliate (
+        CREATE TABLE IF NOT EXISTS Testing.silver_tt_affiliate (
             tanggal DATE,
             toko VARCHAR,
             platform VARCHAR,
@@ -128,7 +127,7 @@ def test_merge_to_silver_duckdb(df_bronze: pd.DataFrame):
     """)
 
     # 4. Read & Transpile SQL
-    print("[SILVER] Running MERGE into SILVER_DB.silver_tt_affiliate ...")
+    print("[SILVER] Running MERGE into Testing.silver_tt_affiliate ...")
     root_dir = Path(__file__).resolve().parents[3]  # Path ke root etl-data-produk/
     sql_path = root_dir / "sql" / "silver_merge_tt_affiliate.sql"
 
@@ -144,5 +143,5 @@ def test_merge_to_silver_duckdb(df_bronze: pd.DataFrame):
 
     print("[SILVER] MERGE DONE")
     print("Show Sampel Data silver_tt_affiliate:")
-    con.sql("SELECT * FROM SILVER_DB.silver_tt_affiliate LIMIT 3").show()
-    con.close() 
+    con.sql("SELECT * FROM Testing.silver_tt_affiliate LIMIT 3").show()
+    con.close()

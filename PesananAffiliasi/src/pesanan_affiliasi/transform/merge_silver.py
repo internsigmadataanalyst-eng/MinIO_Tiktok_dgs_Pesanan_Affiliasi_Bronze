@@ -1,6 +1,6 @@
 # src/pesanan_affiliasi/transform/merge_silver.py
 from pathlib import Path
-from pesanan_affiliasi.utils.bq_client import get_bq_client
+from src.pesanan_affiliasi.utils.bq_client import get_bq_client
 
 
 def merge_to_silver():
