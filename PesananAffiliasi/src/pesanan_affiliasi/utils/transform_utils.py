@@ -2,7 +2,7 @@
 import re
 import numpy as np
 import pandas as pd
-from typing import Any, Dict, List, Union
+from typing import Any, List
 
 EXCEL_EPOCH = pd.Timestamp("1899-12-30")
 
@@ -22,12 +22,11 @@ NUMERIC_COLS = [
     "Pengembalian dana",
 ]
 
-# Kolom persentase komisi: format sel campuran ("5" = 5%, "0.05" = 5%, "5%" = 5%).
-# Dinormalisasi ke persen utuh (whole-number percent) sehingga /100 di silver
-# tetap valid. '%' diizinkan (tidak dianggap corrupt).
-COMMISSION_PCT_COLS = [
-    "Persentase komisi standar",
-    "Persentase komisi Iklan Belanja",
+# Kolom persentase komisi TIDAK divalidasi/dibersihkan di sini: format
+# campurannya ("5" = 5%, "0.05" = 5%, "5%" = 5%) dinormalisasi ke pecahan
+# 0..1 oleh clean_bronze.mixed_percentage setelah tahap validasi.
+# List dibiarkan kosong agar detect_numeric_corruption mengabaikannya.
+PERCENT_COLS = [
 ]
 
 # A valid numeric cell may only contain digits / '.' / ',' / 'Rp' / whitespace /
@@ -85,58 +84,6 @@ def clean_numeric_columns(df: pd.DataFrame, cols, fillna_value=0) -> pd.DataFram
 
         if (df[col] % 1 == 0).all():
             df[col] = df[col].astype(int)
-
-    return df
-
-
-def _parse_pct_number(s: pd.Series) -> pd.Series:
-    """Parses a percent-ish string series to float.
-
-    ',' is treated as decimal separator; when several '.'/'',' appear, only the
-    last one is kept as the decimal separator (the rest are thousand seps).
-    """
-    t = s.str.replace(",", ".", regex=False)
-    multi = t.str.count(r"\.") > 1
-    if multi.any():
-        t.loc[multi] = t.loc[multi].str.replace(r"\.(?=.*\.)", "", regex=True)
-    return pd.to_numeric(t, errors="coerce")
-
-
-def clean_percent_columns(
-    df: pd.DataFrame, cols=None, fillna_value=0
-) -> pd.DataFrame:
-    """Normalizes commission percentage columns to whole-number percent.
-
-    Rules per cell (after strip):
-      - '00%' / '12,5%'  -> drop '%', keep the number          ('5%'   -> 5)
-      - '0.0' / '0.05'   -> decimal-like fraction, x100        ('0.05' -> 5)
-      - '00' / '5'       -> integer-like, keep as-is           ('5'    -> 5)
-      - '-' / '######'/''-> censored/blank -> NaN -> fillna_value
-
-    Output stays compatible with silver's unconditional SAFE_CAST(...)/100.
-    """
-    if cols is None:
-        cols = COMMISSION_PCT_COLS
-    df = df.copy()
-
-    for col in cols:
-        if col not in df.columns:
-            print(f"Kolom '{col}' tidak ditemukan di DataFrame. Lewati Nggih.")
-            continue
-
-        s = df[col].astype(str).str.strip()
-        s = s.replace({"": np.nan, "-": np.nan, "nan": np.nan, "None": np.nan})
-
-        has_pct = s.str.endswith("%", na=False)
-        values = _parse_pct_number(s.str.replace("%", "", regex=False).str.strip())
-
-        # decimal-like WITHOUT '%' means an already-scaled fraction -> x100
-        is_fraction = s.str.contains(r"[.,]", na=False) & ~has_pct
-        values = values.where(~is_fraction, values * 100)
-
-        # selalu float64: nilai desimal (mis. 7,5%) valid, dan dtype stabil
-        # antar-run agar append ke kolom FLOAT64 di BigQuery tidak gagal.
-        df[col] = values.fillna(fillna_value)
 
     return df
 
@@ -269,12 +216,7 @@ def validate_and_normalize_raw(
     corruption = detect_numeric_corruption(
         df, numeric_cols, percent_cols=percent_cols, date_col=date_col
     )
-    df_clean = clean_numeric_columns(
-        df,
-        [c for c in numeric_cols if c not in COMMISSION_PCT_COLS],
-        fillna_value=0,
-    )
-    df_clean = clean_percent_columns(df_clean, COMMISSION_PCT_COLS, fillna_value=0)
+    df_clean = clean_numeric_columns(df, numeric_cols, fillna_value=0)
 
     parsed = parse_mixed_dates(df_clean[date_col], return_date=False)
     df_clean[date_col] = parsed

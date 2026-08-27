@@ -42,13 +42,13 @@ USING (
       UPPER(TRIM(id_konten))                 AS id_konten,
       UPPER(TRIM(commission_model))          AS commission_model,
 
-      -- persen integer (0..100) → 0..1
-      SAFE_CAST(persentase_komisi_standar AS FLOAT64)/100             AS persen_komisi_std,
+      -- persen sudah pecahan (0..1) dari clean_bronze.mixed_percentage; cukup cast
+      SAFE_CAST(persentase_komisi_standar AS FLOAT64)             AS persen_komisi_std,
       SAFE_CAST(est_acuan_komisi AS NUMERIC)                          AS est_acuan_komisi,
       SAFE_CAST(perkiraan_pembayaran_komisi_standar AS NUMERIC)       AS perkiraan_bayar_komisi_std,
       SAFE_CAST(acuan_komisi_aktual AS NUMERIC)                       AS acuan_komisi_aktual,
       SAFE_CAST(pembayaran_komisi_aktual AS NUMERIC)                  AS pembayaran_komisi_aktual,
-      SAFE_CAST(persentase_komisi_iklan_belanja AS FLOAT64)/100       AS persen_komisi_iklan_belanja,
+      SAFE_CAST(persentase_komisi_iklan_belanja AS FLOAT64)       AS persen_komisi_iklan_belanja,
       SAFE_CAST(perkiraan_pembayaran_komisi_iklan_belanja AS NUMERIC) AS perkiraan_bayar_komisi_iklan_belanja,
       SAFE_CAST(pembayaran_komisi_iklan_belanja_aktual AS NUMERIC)    AS bayar_komisi_iklan_belanja_aktual,
       SAFE_CAST(perkiraan_bonus_yang_ditanggung_bersama_untuk_kreator AS NUMERIC) AS perkiraan_bonus_ditanggungkan,

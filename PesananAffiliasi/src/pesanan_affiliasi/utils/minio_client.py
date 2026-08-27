@@ -167,6 +167,80 @@ FIX_MANIFEST_PREFIX = "fix_error_list_watermark"
 QUARANTINE_PREFIX = "quarantine"
 
 
+def _error_date_series(df: pd.DataFrame) -> pd.Series:
+    """Parses the Tanggal column into ISO date strings for error grouping.
+
+    Unparseable dates become the literal 'INVALID_DATE' so they still form a
+    stable group key. Shared by filter_already_quarantined (the dedupe gate)
+    and sync_error_manifest so both use EXACTLY the same matching grain.
+    """
+    from src.pesanan_affiliasi.utils.transform_utils import parse_mixed_dates
+
+    if "Tanggal" in df.columns:
+        parsed = parse_mixed_dates(df["Tanggal"], return_date=False)
+        error_date = parsed.dt.date.astype(str)
+        return error_date.where(parsed.notna(), "INVALID_DATE")
+    return pd.Series("INVALID_DATE", index=df.index)
+
+
+def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.DataFrame, manifest_path: str = ERROR_MANIFEST_PATH) -> pd.DataFrame:
+    """Dedupe gate BEFORE writing quarantine: drops already-quarantined bad rows.
+
+    Compares df_error against the manifest state of the LAST run. A group
+    (sheet_name, creds, error_date) is skipped ONLY when an open manifest entry
+    exists with the same key AND the same n_rows. New tanggal, new sheet, or a
+    changed row count pass through in full and get re-quarantined.
+
+    MUST be called BEFORE sync_error_manifest: that function writes this run's
+    groups into the manifest, so calling it after would make every group look
+    like a duplicate and nothing would ever be quarantined.
+    """
+    if df_error is None or df_error.empty:
+        return df_error
+
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            return df_error
+        raise e
+
+    known = {}
+    for rec in open_records:
+        key = (str(rec.get("sheet_name")), str(rec.get("creds")), str(rec.get("error_date")))
+        try:
+            known[key] = int(rec.get("n_rows") or 0)
+        except (TypeError, ValueError):
+            known[key] = 0
+
+    df = df_error.copy()
+    df["_error_date"] = _error_date_series(df)
+    sn_col = "sheet_name" if "sheet_name" in df.columns else "creds"
+    cr_col = "creds" if "creds" in df.columns else sn_col
+
+    keep = pd.Series(True, index=df.index)
+    n_skip_groups = 0
+    for (sheet_name, creds, error_date), idx in df.groupby([sn_col, cr_col, "_error_date"]).groups.items():
+        key = (str(sheet_name), str(creds), str(error_date))
+        n_rows = len(idx)
+        if known.get(key) == n_rows:
+            keep.loc[idx] = False
+            n_skip_groups += 1
+
+    filtered = df.loc[keep].drop(columns=["_error_date"])
+    skipped = len(df) - int(keep.sum())
+    print(
+        f"[QUARANTINE GATE] {int(keep.sum())} new row(s) -> quarantine | "
+        f"skipped {skipped} duplicate row(s) in {n_skip_groups} group(s)"
+    )
+    return filtered
+
+
 def write_quarantine(minio_client: Minio, bucket: str, df_error: pd.DataFrame, today_key: str, run_key: str):
     """Saves bad rows to MinIO under quarantine/date=YYYYMMDD/<run_key>.parquet."""
     if df_error.empty:

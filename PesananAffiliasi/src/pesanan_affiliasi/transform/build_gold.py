@@ -17,7 +17,15 @@ def build_fact_affiliate(bq_client: bigquery.Client) -> pd.DataFrame:
 
     df_affiliate["tanggal"] = pd.to_datetime(df_affiliate["tanggal"], errors="coerce").dt.date
     
-    if "creator_username" in df_affiliate.columns:
+    # kolom silver bernama nama_pengguna_kreator -> creator_username utk merge
+    if "nama_pengguna_kreator" in df_affiliate.columns:
+        df_affiliate["creator_username"] = (
+            df_affiliate["nama_pengguna_kreator"]
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+    elif "creator_username" in df_affiliate.columns:
         df_affiliate["creator_username"] = (
             df_affiliate["creator_username"]
             .astype(str)

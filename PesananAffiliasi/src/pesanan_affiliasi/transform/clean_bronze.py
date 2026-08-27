@@ -3,33 +3,14 @@ import uuid
 import hashlib
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
 
 from src.pesanan_affiliasi.utils.transform_utils import (
-    # clean_numeric_columns,
     parse_mixed_dates,
     to_snake_case,
 )
 from src.pesanan_affiliasi.utils.minio_client import filter_by_sheet_watermark
-
-
-# NUMERIC_COLS = [
-#     "Harga",
-#     "Payment Amount",
-#     "Kuantitas",
-#     "Persentase komisi standar",
-#     "Est. Acuan Komisi",
-#     "Perkiraan pembayaran komisi standar",
-#     "Acuan Komisi Aktual",
-#     "Pembayaran Komisi Aktual",
-#     "Persentase komisi Iklan Belanja",
-#     "Perkiraan pembayaran komisi Iklan Belanja",
-#     "Pembayaran komisi Iklan Belanja aktual",
-#     "Perkiraan bonus yang ditanggung bersama untuk kreator",
-#     "Bonus sebenarnya yang ditanggung bersama untuk kreator",
-#     "Pengembalian barang",
-#     "Pengembalian dana",
-# ]
 
 
 def _canon(x):
@@ -37,6 +18,40 @@ def _canon(x):
 
     x = "" if pd.isna(x) else str(x).strip()
     return x.upper()
+
+def mixed_percentage(
+    df: pd.DataFrame, column_name: str, fillna_value: float = 0
+) -> pd.DataFrame:
+    """Mixed-format percentage column -> pecahan 0..1.
+
+    Rules per cell (after strip):
+      '5'     -> 0.05   integer-like percent, /100
+      '5%'    -> 0.05   drop '%', /100
+      '12,5%' -> 0.125  comma decimal supported
+      '0.05'  -> 0.05   decimal-like WITHOUT '%' already a fraction, as-is
+      '-' / '' / '######' / nan -> fillna_value
+
+    Returns a copy; output column selalu float64.
+    """
+    df = df.copy()
+
+    s = df[column_name].astype(str).str.strip()
+    s = s.replace({"": np.nan, "-": np.nan, "nan": np.nan, "None": np.nan})
+
+    has_pct = s.str.endswith("%", na=False)
+    values = pd.to_numeric(
+        s.str.replace("%", "", regex=False)
+        .str.strip()
+        .str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+
+    # desimal tanpa '%' = sudah pecahan -> biarkan; '00' & '00%' -> /100
+    is_fraction = s.str.contains(r"[.,]", na=False) & ~has_pct
+    values = values.where(is_fraction, values / 100)
+
+    df[column_name] = values.fillna(fillna_value)
+    return df
 
 
 def build_bronze_affiliate(
@@ -48,12 +63,15 @@ def build_bronze_affiliate(
     Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
     Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
     """
-    # numeric cleaning
-    # tiktok_affiliate_clean1 = clean_numeric_columns(
-    #     tiktok_pesanan_raw, NUMERIC_COLS, fillna_value=0
-    # )
-
+    # numeric cleaning terjadi di validate_and_normalize_raw (run_daily_etl);
+    # di sini hanya persentase campuran yang dinormalisasi.
     tiktok_affiliate_clean1 = tiktok_pesanan_raw.copy()
+
+    # kolom persentase format campuran -> pecahan 0..1 (nama kolom masih asli)
+    for pct_col in ("Persentase komisi standar", "Persentase komisi Iklan Belanja"):
+        if pct_col in tiktok_affiliate_clean1.columns:
+            tiktok_affiliate_clean1 = mixed_percentage(tiktok_affiliate_clean1, pct_col)
+
     # parse tanggal
     tiktok_affiliate_clean1["Waktu Dibuat"] = parse_mixed_dates(
         tiktok_affiliate_clean1["Waktu Dibuat"], return_date=False

@@ -13,17 +13,17 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from src.pesanan_affiliasi.utils.gsheet_client import get_gspread_client
-from src.pesanan_affiliasi.utils.bq_client import get_bq_client
 from src.pesanan_affiliasi.utils.minio_client import (
     get_minio_client,
     get_sheet_watermarks,
     update_sheet_watermarks,
     write_quarantine,
     sync_error_manifest,
+    filter_already_quarantined,
 )
 from src.pesanan_affiliasi.utils.transform_utils import (
     NUMERIC_COLS,
-    COMMISSION_PCT_COLS,
+    PERCENT_COLS,
     validate_and_normalize_raw,
 )
 from src.pesanan_affiliasi.ingestion.fetch_pesanan_affiliasi_gsheet import (
@@ -31,9 +31,7 @@ from src.pesanan_affiliasi.ingestion.fetch_pesanan_affiliasi_gsheet import (
     SHEET_REGISTRY,
 )
 from src.pesanan_affiliasi.transform.clean_bronze import build_bronze_affiliate
-from src.pesanan_affiliasi.transform.merge_silver_duckdb import test_merge_to_silver_duckdb
 from src.pesanan_affiliasi.transform.merge_silver import merge_to_silver
-from src.pesanan_affiliasi.transform.build_gold import build_fact_affiliate
 from src.pesanan_affiliasi.load.load_to_bigquery import load_df
 
 PROJECT_ID = "database-sigma"
@@ -113,7 +111,6 @@ def run_daily_etl():
 
     # 1) Client
     gc = get_gspread_client()
-    bq_client = get_bq_client()
     creds = _get_credentials()
     minio_client, minio_bucket = get_minio_client()
 
@@ -140,7 +137,7 @@ def run_daily_etl():
     # buang baris tanpa id_campaign
     df_raw = df_raw[df_raw["ID Pesanan"].astype(str).str.strip() != ""]
     df_valid, df_error, v_report = validate_and_normalize_raw(
-        df_raw, NUMERIC_COLS, percent_cols=COMMISSION_PCT_COLS
+        df_raw, NUMERIC_COLS, percent_cols=PERCENT_COLS
     )
     print(
         f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "
@@ -158,8 +155,13 @@ def run_daily_etl():
     # Resolved entries feed PATH A (error recovery) below.
     resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid)
 
-    if not df_error.empty:
-        write_quarantine(minio_client, minio_bucket, df_error, today_key, run_key)
+    df_error_new = (
+        filter_already_quarantined(minio_client, minio_bucket, df_error)
+        if not df_error.empty
+        else df_error
+    )
+    if not df_error_new.empty:
+        write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
 
     # PATH A: recovered rows (fixed since last run) bypass the watermark.
     df_recovered = _select_recovered(df_valid, resolved, v_report)
@@ -217,9 +219,7 @@ def run_daily_etl():
         sheet_registry=sheet_registry,
     )
 
-    # 8) Testing Load to Bronze & Silver via DuckDB (In-Memory)
-    # test_merge_to_silver_duckdb(df_bronze)
-
+    # 8) Load to Bronze
     load_df(
         df_bronze,
         table_id="Testing.bronze_affiliate",
@@ -234,19 +234,19 @@ def run_daily_etl():
     merge_to_silver()
     print("[SILVER] MERGE DONE")
 
-    # 5) Gold: fact_live_performa_daily
-    print("[GOLD] Building fact_live_performa_daily ...")
-    df_fact = build_fact_affiliate(bq_client)
-    print(f"[GOLD] Rows fact_live_performa_daily: {len(df_fact)}")
+    # # 5) Gold: fact_live_performa_daily
+    # print("[GOLD] Building fact_live_performa_daily ...")
+    # df_fact = build_fact_affiliate(bq_client)
+    # print(f"[GOLD] Rows fact_live_performa_daily: {len(df_fact)}")
 
-    load_df(
-        df_fact,
-        table_id="Testing.fact_tt_affiliate",
-        project_id=PROJECT_ID,
-        if_exists="replace",  # nanti bisa jadi MERGE kalau mau incremental
-        credentials=creds,
-    )
-    print("[GOLD] Load to GOLD_DB.fact_tt_affiliate DONE")
+    # load_df(
+    #     df_fact,
+    #     table_id="Testing.fact_tt_affiliate",
+    #     project_id=PROJECT_ID,
+    #     if_exists="replace",  # nanti bisa jadi MERGE kalau mau incremental
+    #     credentials=creds,
+    # )
+    # print("[GOLD] Load to GOLD_DB.fact_tt_affiliate DONE")
 
     print("== ETL Pesanan Affiliasi DONE ==")
 
