@@ -60,8 +60,9 @@ def build_bronze_affiliate(
     """
     Dari raw GSheet → cleaning numeric + tanggal + snake_case,
     tambah snapshot_ts, snapshot_date, run_id, row_hash_raw.
-    Filter incremental per sheet_name berdasarkan watermark (sheet_watermarks).
-    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates)
+    Filter incremental per (creds,sheet_name,toko) berdasarkan watermark (sheet_watermarks).
+    Watermark grain is (creds, sheet_name, toko) — toko verbatim, temp sheets (riwa_ajwa) distinguished.
+    Output: (df siap di-load ke BRONZE_DB.bronze_live, sheet_max_dates: {(creds,sheet_name,toko):iso})
     """
     # numeric cleaning terjadi di validate_and_normalize_raw (run_daily_etl);
     # di sini hanya persentase campuran yang dinormalisasi.
@@ -112,9 +113,13 @@ def build_bronze_affiliate(
     df["snapshot_date"] = now_utc.date()
     df["run_id"] = str(uuid.uuid4())
 
-    # row_hash_raw: sesuai scriptmu
-    cols_for_hash = ["waktu_dibuat","toko","id_pesanan","waktu_pembayaran","waktu_pesanan_siap_dikirim","status_pesanan"]
+    # row_hash_raw: grain per order-item (tanggal,toko,id_pesanan,id_produk,id_sku) + waktu to keep idempotency
+    # FIX 2026-08-29: previously hash excluded id_produk/id_sku/tanggal -> multi-item orders
+    # with same id_pesanan collapsed to 1 row (e.g. SDJ 2026-08-01 32->21). Now include them.
+    cols_for_hash = ["tanggal","toko","id_pesanan","id_produk","id_sku","waktu_dibuat","waktu_pembayaran","waktu_pesanan_siap_dikirim","status_pesanan"]
 
+    # Only use cols that exist (defensive for schema evolution)
+    cols_for_hash = [c for c in cols_for_hash if c in df.columns]
     df["row_hash_raw"] = (
         df[cols_for_hash]
         .map(_canon)
@@ -130,12 +135,14 @@ def build_bronze_affiliate(
     cols_to_drop = ['open__target_collaboration', 'jenis_akun', 'jenis_creator']
     df = df.drop(columns=cols_to_drop, errors='ignore')
 
-    # Filter incremental per sheet (sheet_name-keyed) berdasarkan watermark.
-    # Tiap sheet punya watermark sendiri, termasuk yang berbagi creds
-    # (riwa & riwa_ajwa, deni & deni_etawa) agar tidak saling memblokir.
-    if "sheet_name" in df.columns:
+    # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim
+    if "creds" in df.columns and "sheet_name" in df.columns and "toko" in df.columns:
         df, sheet_max_dates = filter_by_sheet_watermark(
-            df, "sheet_name", "tanggal", sheet_watermarks or {}
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
+        )
+    elif "sheet_name" in df.columns:
+        df, sheet_max_dates = filter_by_sheet_watermark(
+            df, "creds", "sheet_name", "toko", "tanggal", sheet_watermarks or {}
         )
     else:
         sheet_max_dates = {}

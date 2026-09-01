@@ -50,9 +50,9 @@ def _select_recovered(
 ) -> pd.DataFrame:
     """PATH A: select rows from df_valid that were recovered from a resolved error.
 
-    A resolved entry (sheet_name, creds, error_date) means the key was in the
-    error manifest last run but is NO LONGER in df_error this run (the data
-    got fixed). Those rows bypass the watermark filter downstream.
+    Grain is (sheet_name, creds, toko, error_date) — toko verbatim.
+    A resolved entry means the key was in the error manifest last run but is NO LONGER
+    in df_error this run (the data got fixed). Those rows bypass the watermark filter downstream.
 
     Full recovery only: we include the key's rows ONLY when the number of
     valid rows now equals the manifest n_rows. Otherwise the group is either
@@ -76,10 +76,23 @@ def _select_recovered(
         report.setdefault("recovery_absent", 0)
         return df.iloc[0:0]
 
+    if "Toko" in df.columns:
+        toko_series = df["Toko"].astype(str)
+    elif "toko" in df.columns:
+        toko_series = df["toko"].astype(str)
+    else:
+        toko_series = pd.Series("", index=df.index, dtype=str)
+
+    try:
+        tanggal_str = df["Tanggal"].dt.date.astype(str)
+    except Exception:
+        tanggal_str = pd.to_datetime(df["Tanggal"]).dt.date.astype(str)
+
     key_series = (
         df["sheet_name"].astype(str)
         + "|" + df["creds"].astype(str)
-        + "|" + df["Tanggal"].dt.date.astype(str)
+        + "|" + toko_series
+        + "|" + tanggal_str
     )
 
     match = pd.Series(False, index=df.index)
@@ -87,7 +100,7 @@ def _select_recovered(
     absent = 0
 
     for r in resolved:
-        key = f'{r["sheet_name"]}|{r["creds"]}|{r["error_date"]}'
+        key = f'{r["sheet_name"]}|{r["creds"]}|{r.get("toko") or ""}|{r["error_date"]}'
         grp = df.index[key_series == key]
         n_expected = int(r.get("n_rows") or 0)
 
@@ -141,7 +154,7 @@ def run_daily_etl():
     )
     print(
         f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "
-        f"(date errors: {v_report['n_date_errors']}) | blank rows dropped: {v_report['n_blank_rows']}"
+        f"(date errors: {v_report['n_date_errors']} | toko_blank: {v_report.get('n_toko_blank',0)}) | blank rows dropped: {v_report['n_blank_rows']}"
     )
     if v_report["has_changes"]:
         print(f"[VALIDATE] Corrupted/Shifted columns: {v_report['affected_columns']}")
