@@ -1,5 +1,6 @@
 # src/pesanan_affiliasi/utils/transform_utils.py
 import re
+from datetime import datetime
 import numpy as np
 import pandas as pd
 from typing import Any, List
@@ -223,6 +224,12 @@ def validate_and_normalize_raw(
     df_clean[date_col] = parsed
     date_error = parsed.isna()
 
+    # Future-date gate (soft quarantine): a validly-parsed date strictly after
+    # today is a wrong input. It is routed to df_error so it never reaches the
+    # watermark filter (thus cannot advance the watermark / poison ingestion).
+    today_ts = pd.Timestamp(datetime.now().date())
+    date_future = parsed.notna() & (parsed > today_ts)
+
     toko_col = "Toko" if "Toko" in df.columns else ("toko" if "toko" in df.columns else None)
     if toko_col is not None:
         raw_toko = df[toko_col].astype(str).str.strip()
@@ -231,7 +238,7 @@ def validate_and_normalize_raw(
     else:
         toko_blank = pd.Series(False, index=df.index)
 
-    error_mask = (corruption["affected_mask"] | date_error | toko_blank) & ~blank_mask
+    error_mask = (corruption["affected_mask"] | date_error | toko_blank | date_future) & ~blank_mask
 
     df_error = df[error_mask].copy()
     reasons = []
@@ -241,6 +248,8 @@ def validate_and_normalize_raw(
             reason_parts.append("numeric_mixed")
         if date_error.loc[idx]:
             reason_parts.append("date_unparsable")
+        if date_future.loc[idx]:
+            reason_parts.append("date_future")
         if toko_blank.loc[idx]:
             reason_parts.append("toko_blank")
         reasons.append("|".join(reason_parts))
@@ -256,6 +265,7 @@ def validate_and_normalize_raw(
         "affected_dates": corruption["affected_dates"],
         "n_bad_rows": int(error_mask.sum()),
         "n_date_errors": int(date_error.sum()),
+        "n_date_future": int(date_future.sum()),
         "n_blank_rows": int(blank_mask.sum()),
         "n_toko_blank": int(toko_blank.sum()),
     }

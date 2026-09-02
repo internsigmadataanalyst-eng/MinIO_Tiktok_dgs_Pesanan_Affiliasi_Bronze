@@ -154,7 +154,7 @@ def run_daily_etl():
     )
     print(
         f"[VALIDATE] Rows valid: {len(df_valid)} | bad rows: {v_report['n_bad_rows']} "
-        f"(date errors: {v_report['n_date_errors']} | toko_blank: {v_report.get('n_toko_blank',0)}) | blank rows dropped: {v_report['n_blank_rows']}"
+        f"(date errors: {v_report['n_date_errors']} | future date errors: {v_report.get('n_date_future',0)} | toko_blank: {v_report.get('n_toko_blank',0)}) | blank rows dropped: {v_report['n_blank_rows']}"
     )
     if v_report["has_changes"]:
         print(f"[VALIDATE] Corrupted/Shifted columns: {v_report['affected_columns']}")
