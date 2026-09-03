@@ -288,10 +288,13 @@ def parse_mixed_dates(series: pd.Series, return_date=True) -> pd.Series:
     mask_dmy2 = s_norm.str.match(r"^\s*\d{1,2}/\d{1,2}/\d{2}\s*$", na=False)
     dmy2 = pd.to_datetime(s_norm.where(mask_dmy2), format="%d/%m/%y", errors="coerce")
 
-    iso_generic = pd.to_datetime(
-        s,
-        errors="coerce",
-        dayfirst=True,
+    iso_generic = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    mask_yearfirst = s_norm.str.match(r"^\s*\d{4}/", na=False)
+    iso_generic.loc[mask_yearfirst] = pd.to_datetime(
+        s_norm.where(mask_yearfirst), errors="coerce", dayfirst=False
+    )
+    iso_generic.loc[~mask_yearfirst] = pd.to_datetime(
+        s_norm.where(~mask_yearfirst), errors="coerce", dayfirst=True
     )
 
     mask_serial = s.str.match(r"^\d{3,6}$", na=False)

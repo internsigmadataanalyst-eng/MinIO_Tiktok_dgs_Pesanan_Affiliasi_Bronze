@@ -2,7 +2,7 @@
 
 import os
 import io
-from datetime import date
+from datetime import datetime
 from google.oauth2 import service_account
 
 import pandas as pd
@@ -43,6 +43,28 @@ def _get_credentials():
     if not sa_path:
         raise RuntimeError("Env GOOGLE_APPLICATION_CREDENTIALS belum di-set")
     return service_account.Credentials.from_service_account_file(sa_path)
+
+
+def _fetch_existing_bronze_hashes(
+    creds, table_id="Testing.bronze_affiliate", project_id=PROJECT_ID
+) -> set:
+    """Returns the set of row_hash_raw already present in Bronze.
+
+    Used as an append-time idempotency gate: boundary-day rows (tanggal ==
+    watermark) and re-loaded recovery rows are legitimately re-selected by the
+    watermark filter every run; this drops the ones whose content is unchanged,
+    so Bronze stops accumulating duplicates while still accepting edits (a
+    changed row produces a NEW hash and flows through).
+    """
+    from pandas_gbq import read_gbq
+
+    df_hashes = read_gbq(
+        f"SELECT DISTINCT row_hash_raw FROM `{project_id}.{table_id}`",
+        project_id=project_id,
+        credentials=creds,
+        dialect="standard",
+    )
+    return set(df_hashes["row_hash_raw"].dropna().astype(str))
 
 
 def _select_recovered(
@@ -119,19 +141,25 @@ def _select_recovered(
     return df[match]
 
 
-def run_daily_etl():
+def run_daily_etl(dry_run: bool | None = None):
     print("== Start ETL Pesanan Affiliasi ==")
+
+    if dry_run is None:
+        dry_run = os.getenv("ETL_DRY_RUN", "0").strip().lower() in {"1", "true", "yes", "y"}
+
+    if dry_run:
+        print("[DRY-RUN] Mode aktif: TIDAK ada data yang ditulis ke MinIO/BigQuery/Silver.")
 
     # 1) Client
     gc = get_gspread_client()
     creds = _get_credentials()
     minio_client, minio_bucket = get_minio_client()
 
-    # 2) Date key: partition pakai YYYYMMDD, nama file pakai YYYYMMDDHH
-    #    (jam agar 2 run di hari yang sama menghasilkan file terpisah, tanpa overwrite).
-    today_obj = date.today()
-    today_key = today_obj.strftime("%Y%m%d")
-    run_key = today_obj.strftime("%Y%m%d%H")
+    # 2) Date key: partition pakai YYYYMMDD, nama file pakai YYYYMMDDHHMM
+    #    (jam+menit agar 2 run di hari yang sama menghasilkan file terpisah, tanpa overwrite).
+    now_obj = datetime.now()
+    today_key = now_obj.strftime("%Y%m%d")
+    run_key = now_obj.strftime("%Y%m%d%H%M")
 
     # 3) Per-sheet watermark check
     # sheet_registry hanya dibutuhkan utk FAILSAFE migrasi format lama (sheet_name -> creds).
@@ -166,7 +194,7 @@ def run_daily_etl():
     # STEP 3Q/6: sync error manifest EVERY run (append new open entries +
     # resolve entries whose format has been fixed since the last run).
     # Resolved entries feed PATH A (error recovery) below.
-    resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid)
+    resolved = sync_error_manifest(minio_client, minio_bucket, df_error, v_report, today_key, run_key, df_valid=df_valid, dry_run=dry_run)
 
     df_error_new = (
         filter_already_quarantined(minio_client, minio_bucket, df_error)
@@ -174,7 +202,10 @@ def run_daily_etl():
         else df_error
     )
     if not df_error_new.empty:
-        write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
+        if dry_run:
+            print(f"[DRY-RUN] Akan quarantine {len(df_error_new)} bad row(s)")
+        else:
+            write_quarantine(minio_client, minio_bucket, df_error_new, today_key, run_key)
 
     # PATH A: recovered rows (fixed since last run) bypass the watermark.
     df_recovered = _select_recovered(df_valid, resolved, v_report)
@@ -191,17 +222,58 @@ def run_daily_etl():
         df_regular, sheet_watermarks=watermark_map
     )
 
-    # PATH A transform: empty watermarks = full load, max dates discarded.
+    # PATH A transform: recovery rows bypass the watermark (full load). Their
+    # max dates are merged into the watermark advance so they aren't re-selected
+    # (and duplicated) by PATH B on the next run.
     if df_recovered.empty:
         df_bronze_recovered = df_bronze_regular.iloc[0:0]
     else:
-        df_bronze_recovered, _ = build_bronze_affiliate(df_recovered, sheet_watermarks={})
+        df_bronze_recovered, recovered_max_dates = build_bronze_affiliate(
+            df_recovered, sheet_watermarks={}
+        )
+        for key, max_date in recovered_max_dates.items():
+            sheet_max_dates[key] = max(sheet_max_dates.get(key, max_date), max_date)
 
     # MERGE & DEDUPLICATE
     df_bronze = pd.concat(
         [df_bronze_regular, df_bronze_recovered], ignore_index=True
     ).drop_duplicates(subset=["row_hash_raw"])
+
+    # Idempotency gate: drop rows whose content hash already exists in Bronze.
+    # Boundary-day re-emissions and previously-recovered rows are re-selected by
+    # the watermark each run; only genuinely new/changed rows should be appended.
+    if not df_bronze.empty:
+        existing_hashes = _fetch_existing_bronze_hashes(creds)
+        if existing_hashes:
+            before = len(df_bronze)
+            df_bronze = df_bronze[
+                ~df_bronze["row_hash_raw"].astype(str).isin(existing_hashes)
+            ]
+            skipped = before - len(df_bronze)
+            if skipped:
+                print(
+                    f"[IDEMPOTENCY] Skipped {skipped} row(s) already present in bronze"
+                )
+
     print(f"[BRONZE] Rows bronze to load: {len(df_bronze)}")
+
+    # Nothing new to append: if rows were still selected (boundary-day /
+    # recovered re-emissions) but every one already exists in Bronze, advance
+    # the watermark anyway so they stop being re-selected every run.
+    if df_bronze.empty and sheet_max_dates:
+        if dry_run:
+            for (creds, sheet_name, toko), max_date in sheet_max_dates.items():
+                print(f"[DRY-RUN]   watermark update ({creds}, {sheet_name}, {toko}) -> {max_date}")
+            print("[DRY-RUN] Akan update watermark (tanpa upload parquet).")
+            print("== ETL Pesanan Affiliasi DONE (DRY-RUN) ==")
+            return
+        update_sheet_watermarks(
+            minio_client, minio_bucket, WATERMARK_PATH, watermark_records,
+            sheet_max_dates, sheet_registry=sheet_registry,
+        )
+        print("[MINIO] Watermark advanced (no new rows to append).")
+        print("== ETL Pesanan Affiliasi DONE ==")
+        return
 
     if df_bronze.empty:
         print("[MINIO] No new data to process. Data is up-to-date.")
@@ -211,6 +283,15 @@ def run_daily_etl():
     # 6) Parquet conversion & Load to MinIO
     file_path = f"pesanan/affiliasi/date={today_key}/affiliasi_{run_key}.parquet"
     folder_path = f"pesanan/affiliasi/date={today_key}/"
+
+    if dry_run:
+        print(f"[DRY-RUN] Akan upload {len(df_bronze)} baris ke '{file_path}'")
+        for (creds, sheet_name, toko), max_date in sheet_max_dates.items():
+            print(f"[DRY-RUN]   watermark update ({creds}, {sheet_name}, {toko}) -> {max_date}")
+        print("[DRY-RUN] Akan: append ke Testing.bronze_affiliate + MERGE ke silver_tt_affiliate")
+        print("[DRY-RUN] Selesai. TIDAK ada data yang ditulis (dry-run).")
+        print("== ETL Pesanan Affiliasi DONE (DRY-RUN) ==")
+        return
 
     # Folder partition marker
     minio_client.put_object(minio_bucket, folder_path, io.BytesIO(b""), length=0)
