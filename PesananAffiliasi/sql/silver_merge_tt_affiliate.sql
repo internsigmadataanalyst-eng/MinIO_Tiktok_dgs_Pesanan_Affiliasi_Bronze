@@ -1,4 +1,4 @@
-MERGE `database-sigma.Testing.silver_tt_affiliate` T
+MERGE `database-sigma.SILVER_DB.silver_tt_affiliate` T
 USING (
   -- pilih snapshot terbaru per order-item per tanggal
   WITH latest_raw AS (
@@ -12,7 +12,7 @@ USING (
                             UPPER(TRIM(COALESCE(b.id_sku,'')))
                ORDER BY b.snapshot_ts DESC, b.run_id DESC
              ) rn
-      FROM `database-sigma.Testing.bronze_affiliate` b
+      FROM `database-sigma.BRONZE_DB.bronze_affiliate` b
     )
     WHERE rn = 1
   ),
@@ -42,7 +42,7 @@ USING (
       UPPER(TRIM(id_konten))                 AS id_konten,
       UPPER(TRIM(commission_model))          AS commission_model,
 
-      -- persen sudah pecahan (0..1) dari clean_bronze.mixed_percentage; cukup cast
+      -- persen integer (%) dari clean_bronze.mixed_percentage (10 = 10%); cukup cast
       SAFE_CAST(persentase_komisi_standar AS FLOAT64)             AS persen_komisi_std,
       SAFE_CAST(est_acuan_komisi AS NUMERIC)                          AS est_acuan_komisi,
       SAFE_CAST(perkiraan_pembayaran_komisi_standar AS NUMERIC)       AS perkiraan_bayar_komisi_std,

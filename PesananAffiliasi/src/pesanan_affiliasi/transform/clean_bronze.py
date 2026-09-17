@@ -20,18 +20,19 @@ def _canon(x):
     return x.upper()
 
 def mixed_percentage(
-    df: pd.DataFrame, column_name: str, fillna_value: float = 0
+    df: pd.DataFrame, column_name: str, fillna_value: int = 0
 ) -> pd.DataFrame:
-    """Mixed-format percentage column -> pecahan 0..1.
+    """Mixed-format percentage column -> integer percent (10 = 10%).
 
     Rules per cell (after strip):
-      '5'     -> 0.05   integer-like percent, /100
-      '5%'    -> 0.05   drop '%', /100
-      '12,5%' -> 0.125  comma decimal supported
-      '0.05'  -> 0.05   decimal-like WITHOUT '%' already a fraction, as-is
+      '5'     -> 5    integer-like percent, as-is
+      '5%'    -> 5    drop '%'
+      '12,5%' -> 12   comma decimal supported (*100, rounded half-to-even)
+      '0.05'  -> 5    decimal-like WITHOUT '%' treated as a fraction, *100
       '-' / '' / '######' / nan -> fillna_value
 
-    Returns a copy; output column selalu float64.
+    Output matches the bronze/silver convention: integer percent units stored
+    as int64 (e.g. 10 = 10%). Returns a copy.
     """
     df = df.copy()
 
@@ -46,11 +47,14 @@ def mixed_percentage(
         errors="coerce",
     )
 
-    # desimal tanpa '%' = sudah pecahan -> biarkan; '00' & '00%' -> /100
+    # desimal tanpa '%' = sudah pecahan -> biarkan; '5' & '5%' -> /100
     is_fraction = s.str.contains(r"[.,]", na=False) & ~has_pct
     values = values.where(is_fraction, values / 100)
 
-    df[column_name] = values.fillna(fillna_value)
+    # pecahan 0..1 -> integer persen (10 = 10%), konsisten dgn schema bronze INT64
+    df[column_name] = (
+        values.fillna(fillna_value) * 100
+    ).round().astype("int64")
     return df
 
 
@@ -132,7 +136,7 @@ def build_bronze_affiliate(
     df = df.loc[:, df.columns.str.strip().astype(bool)]
 
     # buang kolom dengan data spesifik
-    cols_to_drop = ['open__target_collaboration', 'jenis_akun', 'jenis_creator']
+    cols_to_drop = ['open__target_collaboration', 'jenis_akun', 'jenis_creator', 'pengembalian_barang_atau_dana']
     df = df.drop(columns=cols_to_drop, errors='ignore')
 
     # Filter incremental per (creds,sheet_name,toko) — triple grain verbatim

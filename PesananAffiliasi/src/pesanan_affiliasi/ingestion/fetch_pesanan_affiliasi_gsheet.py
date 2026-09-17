@@ -4,6 +4,8 @@ import os
 import gspread
 import pandas as pd
 
+from src.pesanan_affiliasi.utils.gsheet_client import with_retry_on_429
+
 
 # tag -> (env key GSheet, nama worksheet). Setiap aliran data punya tag UNIK:
 # worksheet sementara (riwa_ajwa & deni_etawa) adalah aliran terpisah meskipun
@@ -51,9 +53,9 @@ def fetch_tiktok_pesanan_affiliasi(gc: gspread.Client) -> pd.DataFrame:
     """
     sheets = {}
     for sheet_name, (env_key, worksheet) in SHEET_REGISTRY.items():
-        sh = gc.open_by_key(os.getenv(env_key))
-        ws = sh.worksheet(worksheet)
-        values = ws.get_all_values()
+        sh = with_retry_on_429(gc.open_by_key, os.getenv(env_key))
+        ws = with_retry_on_429(sh.worksheet, worksheet)
+        values = with_retry_on_429(ws.get_all_values)
         sheets[sheet_name] = pd.DataFrame(values[3:], columns=values[2])
         print(f"[INGEST] {sheet_name}: {len(sheets[sheet_name])} rows")
 

@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 .venv/
+scripts/
 
 # Secrets
 .env
+
+# ETL logs
+logs/

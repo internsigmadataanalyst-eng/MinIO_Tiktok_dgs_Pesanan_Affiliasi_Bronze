@@ -25,6 +25,24 @@ def get_minio_client() -> tuple[Minio, str]:
     return client, minio_bucket
 
 
+def _clamp_watermark_date(val) -> str:
+    """Clamps a watermark date value to at most today.
+
+    A future-dated watermark is always the result of bad input (a future-date
+    row that slipped through), and it would silently drop legitimate rows.
+    Unparseable values pass through unchanged.
+    """
+    s = str(val or "").strip()[:10]
+    try:
+        parsed = pd.to_datetime(s)
+    except Exception:
+        return s
+    if pd.isna(parsed):
+        return s
+    today = pd.Timestamp(date.today())
+    return min(parsed, today).date().isoformat()
+
+
 def get_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: str, sheet_registry: dict | None = None) -> tuple[dict, list]:
     """Fetches the per-sheet watermark table from MinIO.
 
@@ -84,7 +102,9 @@ def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: st
             "creds": creds,
             "sheet_name": sheet_name or creds,
             "toko": toko,
-            "last_processed_date": str(rec.get("last_processed_date") or rec.get("last_update") or "").strip()[:10],
+            "last_processed_date": _clamp_watermark_date(
+                rec.get("last_processed_date") or rec.get("last_update") or ""
+            ),
             "updated_at": str(rec.get("updated_at") or rec.get("update_at") or "") or now,
         }
 
@@ -96,7 +116,7 @@ def update_sheet_watermarks(minio_client: Minio, bucket: str, watermark_path: st
             "creds": creds,
             "sheet_name": sheet_name or creds,
             "toko": toko,
-            "last_processed_date": str(max_date).strip()[:10],
+            "last_processed_date": _clamp_watermark_date(max_date),
             "updated_at": now,
         }
 
@@ -522,7 +542,7 @@ def filter_by_sheet_watermark(df: pd.DataFrame, creds_col: str, sheet_name_col: 
             toko_k = str(keys[2]) if len(keys) > 2 and pd.notna(keys[2]) else (str(keys[1]) if len(keys)==2 else "")
             wm = watermarks.get((creds_k, sheet_k, toko_k))
             if wm:
-                cutoff = pd.Timestamp(wm)
+                cutoff = min(pd.Timestamp(wm), pd.Timestamp(date.today()))
                 keep.loc[idx] = parsed.loc[idx] >= cutoff
         filtered = df[keep].copy()
         sheet_max_dates = {}
@@ -545,7 +565,7 @@ def filter_by_sheet_watermark(df: pd.DataFrame, creds_col: str, sheet_name_col: 
         toko_key = "" if pd.isna(toko_val) else str(toko_val)
         wm = watermarks.get((creds_key, sheet_key, toko_key))
         if wm:
-            cutoff = pd.Timestamp(wm)
+            cutoff = min(pd.Timestamp(wm), pd.Timestamp(date.today()))
             keep.loc[idx] = parsed.loc[idx] >= cutoff
 
     filtered = df[keep].copy()
