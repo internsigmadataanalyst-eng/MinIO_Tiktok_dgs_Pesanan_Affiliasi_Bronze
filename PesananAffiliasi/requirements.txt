@@ -3,6 +3,7 @@ pandas-gbq
 gspread
 google-cloud-bigquery
 google-auth
+google-api-python-client
 pyarrow
 numpy
 minio
