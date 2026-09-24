@@ -149,3 +149,42 @@ def emit(
     }
     _event_file.write(json.dumps(event, default=str) + "\n")
     _event_file.flush()
+
+
+def write_wm_log(log_folder, run_key, status_df, sheet_passes, verdict_msg):
+    """Write the watermark drift check log file."""
+    wm_log_lines = []
+    wm_log_lines.append(
+        f"=== WATERMARK DRIFT CHECK - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+    )
+
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append("DATASET: PESANAN AFFILIASI (toko grain)")
+    wm_log_lines.append("-" * 50)
+    wm_log_lines.append(f"  {'sheet':<10} {'grain':<12} {'live':<12} {'wm':<12} {'status'}")
+    for _, row in status_df.iterrows():
+        n_future = int(row.get("n_future_rows") or 0)
+        wm_log_lines.append(
+            f"  {str(row['sheet_name']):<10} {str(row['grain']):<12} "
+            f"{str(row['sheet_max_tanggal']):<12} {str(row['last_processed_date']):<12} "
+            f"{'BEHIND' if row['is_behind'] else 'ok'}"
+            + (f" (ignored future rows: {n_future})" if n_future else "")
+        )
+
+    wm_log_lines.append(f"\nGate verdict: {verdict_msg}")
+    pass_count = int(sheet_passes.sum()) if len(sheet_passes) else 0
+    total = len(sheet_passes)
+    wm_log_lines.append(f"  {pass_count}/{total} sheets have >=1 toko behind")
+
+    write_section_log(log_folder, f"wm_monitor_logs_{run_key}.log", "\n".join(wm_log_lines) + "\n")
+
+
+def write_failure_log(log_folder, run_key, message: str):
+    """Write a gate-abort failure log file for this run."""
+    f_path = write_section_log(
+        log_folder,
+        f"etl_failed_{run_key}.log",
+        f"ETL FAILED because: {message}\n",
+    )
+    print(f"[FATAL] ETL failed because: {message}")
+    print(f"[FATAL] Failure written to: {f_path}")

@@ -29,6 +29,8 @@ NUMERIC_COLS = [
 # 0..1 oleh clean_bronze.mixed_percentage setelah tahap validasi.
 # List dibiarkan kosong agar detect_numeric_corruption mengabaikannya.
 PERCENT_COLS = [
+    "Persentase komisi standar",
+    "Persentase komisi Iklan Belanja",
 ]
 
 # Kolom ID (pesanan/produk/sku/konten). Nilai valid harus digit murni (0-9);

@@ -9,6 +9,7 @@ scripts/
 
 # Testing
 PLANNING_STAGE.md
+tests/
 
 # ETL logs
 logs/

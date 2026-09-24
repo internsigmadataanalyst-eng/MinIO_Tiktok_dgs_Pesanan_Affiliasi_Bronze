@@ -62,6 +62,9 @@ SMTP_PORT = int(os.getenv("NOTIFY_SMTP_PORT", "587"))
 SENDER_EMAIL = os.getenv("NOTIFY_SENDER_EMAIL", "")
 SENDER_APP_PASSWORD = os.getenv("NOTIFY_SENDER_APP_PASSWORD", "")
 
+# Persistent SMTP connection (created lazily on first send, closed by close_smtp).
+_smtp_server: smtplib.SMTP | None = None
+
 # Default recipient list for pipeline alerts (shared by both backends).
 DEFAULT_RECIPIENTS = [
     r.strip()
@@ -71,6 +74,23 @@ DEFAULT_RECIPIENTS = [
 
 # Number of sample bad rows included (source order) in the quarantine email.
 QUARANTINE_SAMPLE_ROWS = int(os.getenv("NOTIFY_QUARANTINE_SAMPLE_ROWS", "3"))
+
+# --- AI alert explanations (best-effort, downstream of validation only) ---
+# Shared by the quarantine / failure / gate-abort / recovery emails. Runs
+# only when enabled AND GEMINI_API_KEY is set; any failure (missing key,
+# package not installed, API error/timeout) falls back to the templated email
+# content. Never affects data correctness or blocks the pipeline.
+AI_EXPLAIN = os.getenv("NOTIFY_AI_EXPLAIN", "true").strip().lower() in {
+    "1", "true", "yes", "y",
+}
+# gemini-3.1-flash-lite is the token-efficient free-tier default for this
+# 2-4 sentence task (3.6-flash's hidden reasoning wasted ~800 tokens/call);
+# override via QUARANTINE_AI_MODEL.
+QUARANTINE_AI_MODEL = os.getenv("QUARANTINE_AI_MODEL", "gemini-3.1-flash-lite")
+QUARANTINE_AI_TIMEOUT_S = int(os.getenv("QUARANTINE_AI_TIMEOUT_S", "15"))
+# gemini-3.x flash hides its reasoning inside the token budget, so a small
+# cap truncates the visible explanation — allow room for both.
+QUARANTINE_AI_MAX_TOKENS = int(os.getenv("QUARANTINE_AI_MAX_TOKENS", "1000"))
 
 
 def _send_via_gmail_api(subject: str, body_html: str, to_list: list[str]) -> None:
@@ -101,6 +121,7 @@ def _send_via_gmail_api(subject: str, body_html: str, to_list: list[str]) -> Non
 
 
 def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
+    global _smtp_server
     if not SENDER_EMAIL or not SENDER_APP_PASSWORD:
         raise RuntimeError(
             "NOTIFY_SENDER_EMAIL / NOTIFY_SENDER_APP_PASSWORD not set — "
@@ -112,12 +133,35 @@ def _send_via_smtp(subject: str, body_html: str, to_list: list[str]) -> None:
     msg["From"] = SENDER_EMAIL
     msg["To"] = ", ".join(to_list)
 
-    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-        server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+    if _smtp_server is None:
+        _smtp_server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        _smtp_server.ehlo()
+        _smtp_server.starttls()
+        _smtp_server.ehlo()
+        _smtp_server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+
+    try:
+        _smtp_server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+    except (smtplib.SMTPException, ConnectionError, OSError):
+        # Connection stale or dropped — reconnect once and retry
+        _smtp_server = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+        _smtp_server.ehlo()
+        _smtp_server.starttls()
+        _smtp_server.ehlo()
+        _smtp_server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
+        _smtp_server.sendmail(SENDER_EMAIL, to_list, msg.as_string())
+
+
+def close_smtp() -> None:
+    """Gracefully close the shared SMTP connection. No-op if not connected."""
+    global _smtp_server
+    if _smtp_server is None:
+        return
+    try:
+        _smtp_server.quit()
+    except Exception:
+        pass
+    _smtp_server = None
 
 
 def send_alert_email(
@@ -292,23 +336,28 @@ def build_pipeline_failure_email(
     run_key: str = "",
     log_path: str = "",
     stage: str = "",
+    enable_explanation: bool = True,
     bq_updates: list[dict] | None = None,
     minio_files: list[str] | None = None,
     rollback_hint: str = "",
-    rollback_command: str = "",
-    auto_rollback_note: str = "",
 ) -> tuple[str, str]:
     """Summary email for an unhandled pipeline exception.
 
     `stage` names the pipeline stage that failed (e.g. BigQuery bronze load).
     `minio_files` lists MinIO artifacts written/maybe-written this run so an
     operator can decide on rollback; `rollback_hint` gives stage-accurate
-    guidance, `rollback_command` a ready-to-paste manual command, and
-    `auto_rollback_note` reports what (if anything) the pipeline already
-    restored automatically (see minio_rollback.py).
+    guidance. When `enable_explanation` is true, a best-effort AI plain-language
+    summary is prepended.
     """
     subject = f"[ETL ALERT — {pipeline_name}] Pipeline FAILED"
-    parts = [
+    parts = []
+    if enable_explanation:
+        explanation = explain_pipeline_failure(
+            error, stage=stage, rollback_hint=rollback_hint
+        )
+        if explanation:
+            parts.append(_explanation_html(explanation))
+    parts += [
         f"<p><b>Pipeline:</b> {pipeline_name}</p>",
         f"<p><b>Error type:</b> {type(error).__name__}</p>",
         f"<p><b>Message:</b> {_html.escape(str(error))}</p>",
@@ -333,12 +382,6 @@ def build_pipeline_failure_email(
         )
     if rollback_hint:
         parts.append(f"<p><b>Rollback guidance:</b> {_html.escape(rollback_hint)}</p>")
-    if auto_rollback_note:
-        parts.append(f"<p><b>Auto rollback:</b> {_html.escape(auto_rollback_note)}</p>")
-    if rollback_command:
-        parts.append(
-            f"<p><b>Rollback command:</b> <code>{_html.escape(rollback_command)}</code></p>"
-        )
 
     body = (
         "<html><body><h3>Pipeline run failed</h3>"
@@ -354,6 +397,7 @@ def build_gate_abort_email(
     mode: str = "",
     lists: dict[str, list] | None = None,
     note: str = "",
+    enable_explanation: bool = True,
     bq_updates: list[dict] | None = None,
     drift_rows: list[dict] | None = None,
     pipeline_name: str = PIPELINE_NAME,
@@ -364,9 +408,18 @@ def build_gate_abort_email(
     lists (e.g. {"error_sheets": [...]}), rendered as one <p> per label.
     `drift_rows` is the per-sheet watermark-drift table (Sheet | Toko |
     Sheet max date | Current watermark | Status), rendered when provided.
+    When `enable_explanation` is true, a best-effort AI plain-language
+    summary is prepended.
     """
     subject = f"[ETL ALERT — {pipeline_name}] ETL aborted — pre-flight gate {gate} rejected"
-    parts = [f"<p>{_html.escape(message)}</p>"]
+    parts = []
+    if enable_explanation:
+        explanation = explain_gate_abort(
+            gate, message, mode, lists, drift_rows
+        )
+        if explanation:
+            parts.append(_explanation_html(explanation))
+    parts.append(f"<p>{_html.escape(message)}</p>")
     if mode:
         parts.append(f"<p><b>Mode:</b> {_html.escape(mode)}</p>")
     for label, items in (lists or {}).items():
@@ -410,8 +463,203 @@ def build_gate_abort_email(
     )
     return subject, body
 
+QUARANTINE_SAMPLE_COLUMNS = [
+    "sheet_name",
+    "Tanggal",
+    "Toko",
+    "ID Pesanan",
+    "ID Produk",
+    "Produk",
+    "ID Sku",
+    "Harga",
+    "Payment Amount",
+    "Mata Uang",
+    "Kuantitas",
+    "Pengembalian Barang Atau Dana",
+    "Metode Pembayaran",
+    "Status Pesanan",
+    "Nama pengguna kreator",
+    "Jenis Konten",
+    "ID Konten",
+    "commission model",
+    "Persentase komisi standar",
+    "Est. Acuan Komisi",
+    "Perkiraan pembayaran komisi standar",
+    "Acuan Komisi Aktual",
+    "Pembayaran Komisi Aktual",
+    "Waktu Dibuat",
+    "Waktu Pembayaran",
+    "Order Delivery Time",
+    "Waktu Komisi Dibayar",
+    "Platform",
+    "error_reason"
+]
 
-QUARANTINE_SAMPLE_COLUMNS = ["sheet_name", "Tanggal", "Toko", "ID Pesanan", "error_reason"]
+def _resolve_gemini_api_key() -> str:
+    """Resolve GEMINI_API_KEY, supporting either a literal key or a path to a
+    file containing the key (e.g. C:/CREDS/bg-test/gemini-api-key.txt).
+
+    Returns "" when unset or when the referenced file is missing/empty, so
+    callers fail open. Reads the file on each call (explanation is rare and
+    the key can rotate without a restart).
+    """
+    val = os.getenv("GEMINI_API_KEY", "").strip()
+    if not val:
+        return ""
+    if os.path.isfile(val):
+        try:
+            with open(val, "r", encoding="utf-8") as fh:
+                key = fh.read().strip()
+            return key
+        except OSError:
+            return ""
+    return val
+
+
+def _llm_explain(prompt: str) -> str:
+    """Shared best-effort LLM call for alert explanations.
+
+    Returns "" when disabled, misconfigured, empty prompt, or on any API
+    failure — the alert email still sends with its existing templated content.
+    Purely informational: nothing here influences data correctness.
+    """
+    if not AI_EXPLAIN:
+        return ""
+    if not _resolve_gemini_api_key():
+        return ""
+    if not prompt or not prompt.strip():
+        return ""
+
+    try:
+        import warnings
+
+        # The legacy package is deprecated (google-genai is the replacement);
+        # silence the one-time FutureWarning so ETL logs stay clean.
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=FutureWarning)
+            import google.generativeai as genai
+
+        genai.configure(api_key=_resolve_gemini_api_key())
+        model = genai.GenerativeModel(QUARANTINE_AI_MODEL)
+        response = model.generate_content(
+            prompt,
+            generation_config={"max_output_tokens": QUARANTINE_AI_MAX_TOKENS},
+            request_options={"timeout": QUARANTINE_AI_TIMEOUT_S},
+        )
+        return response.text.strip()
+    except Exception as e:
+        print(f"[AI_EXPLAIN] Failed, falling back to no explanation: {e}")
+        return ""
+
+
+def _explanation_html(explanation: str) -> str:
+    """Highlighted 'What happened' box for an AI explanation (best-effort)."""
+    if not explanation:
+        return ""
+    return (
+        "<p style='background:#fff3cd;border-left:4px solid #f0ad4e;"
+        "padding:8px 12px;margin:0 0 12px 0;'>"
+        f"<b>What happened:</b> {_html.escape(explanation)}</p>"
+    )
+
+
+def explain_quarantine(
+    reason_counts: dict | None,
+    affected_cols: list | None,
+    sample_rows: list | None,
+    dataset_name: str = "",
+) -> str:
+    """Best-effort plain-language explanation of why rows were quarantined,
+    for a non-technical sheet owner. Returns "" when input is empty, disabled,
+    misconfigured, or on any API failure (see _llm_explain)."""
+    if not reason_counts:
+        return ""
+
+    prompt = f"""You are explaining a data-validation failure to a
+non-technical spreadsheet owner. Be brief (2-4 sentences), plain language,
+no jargon like "row_hash" or "watermark". Say what's wrong and what to
+fix, in Bahasa Indonesia if the sample data looks Indonesian.
+
+Dataset: {dataset_name}
+Error reasons and counts: {reason_counts}
+Affected columns: {affected_cols}
+Sample bad rows (first few): {sample_rows}
+
+Write only the explanation, no preamble."""
+    return _llm_explain(prompt)
+
+
+def explain_pipeline_failure(
+    error: Exception | None,
+    stage: str = "",
+    rollback_hint: str = "",
+) -> str:
+    """Best-effort plain-language explanation of an unhandled pipeline
+    failure. `error` message is truncated (~600 chars) to bound tokens."""
+    if error is None:
+        return ""
+
+    prompt = f"""You are explaining an automated ETL pipeline failure to a
+non-technical spreadsheet owner. Be brief (2-4 sentences), plain language,
+no jargon. Say roughly what failed at which stage and what should be done
+next, in Bahasa Indonesia if the context looks Indonesian.
+
+Error type: {type(error).__name__}
+Error message: {str(error)[:600]}
+Stage failed: {stage or 'unknown'}
+Rollback guidance: {rollback_hint or 'none given'}
+
+Write only the explanation, no preamble."""
+    return _llm_explain(prompt)
+
+
+def explain_gate_abort(
+    gate: str = "",
+    message: str = "",
+    mode: str = "",
+    lists: dict | None = None,
+    drift_rows: list[dict] | None = None,
+) -> str:
+    """Best-effort plain-language explanation of why a pre-flight gate
+    stopped the pipeline before any data was written."""
+    prompt = f"""You are explaining why an automated data pipeline was stopped
+before loading data, to a non-technical spreadsheet owner. Be brief (2-4
+sentences), plain language, no jargon. Say why the run was blocked, which
+sheets are involved, and whether action is needed, in Bahasa Indonesia if
+the context looks Indonesian.
+
+Gate: {gate}
+Message: {message}
+Mode: {mode}
+Detail: {lists or {}}
+Watermark drift table: {drift_rows or 'none'}
+
+Write only the explanation, no preamble."""
+    return _llm_explain(prompt)
+
+
+def explain_recovery(
+    dataset_name: str = "",
+    resolved: int = 0,
+    recovered_rows: int = 0,
+    absent: int = 0,
+    count_mismatch_skipped: int = 0,
+) -> str:
+    """Best-effort plain-language explanation of an automatic recovery,
+    for a non-technical sheet owner."""
+    prompt = f"""You are explaining an automatic data-pipeline recovery to a
+non-technical spreadsheet owner. Be brief (2-4 sentences), plain language,
+no jargon. Say that previously-broken rows were fixed and re-loaded, in
+Bahasa Indonesia if the context looks Indonesian.
+
+Dataset: {dataset_name or 'unknown'}
+Previously-broken entries now resolved: {resolved}
+Rows re-loaded: {recovered_rows}
+Rows removed from the sheet: {absent}
+Count-mismatch entries skipped: {count_mismatch_skipped}
+
+Write only the explanation, no preamble."""
+    return _llm_explain(prompt)
 
 
 def build_quarantine_email(
@@ -421,7 +669,10 @@ def build_quarantine_email(
     sample_rows: list[dict] | None = None,
     minio_path: str = "",
     log_path: str = "",
+    n_duplicates_skipped: int = 0,
     sample_size: int = QUARANTINE_SAMPLE_ROWS,
+    dataset_name: str = "",
+    enable_explanation: bool = True,
     bq_updates: list[dict] | None = None,
     pipeline_name: str = PIPELINE_NAME,
 ) -> tuple[str, str]:
@@ -430,9 +681,24 @@ def build_quarantine_email(
     `sample_rows` is a list of dicts (source order, at most `sample_size`)
     with keys from QUARANTINE_SAMPLE_COLUMNS, rendered as an HTML table.
     `minio_path` / `log_path` point to the full quarantine data records.
+    When `enable_explanation` is true, an AI-generated plain-language summary
+    (see explain_quarantine) is prepended; it is best-effort and never
+    replaces or blocks the rest of the content.
     """
-    subject = f"[ETL ALERT — {pipeline_name}] Quarantine — {n_quarantined} bad row(s) quarantined"
-    parts = [f"<p><b>Quarantined this run:</b> {n_quarantined} row(s)</p>"]
+    subject = f"[ETL ALERT — {pipeline_name}] Quarantine — {n_quarantined} bad row(s) detected"
+    parts = []
+    if enable_explanation:
+        explanation = explain_quarantine(
+            reason_counts, affected_columns, sample_rows, dataset_name=dataset_name
+        )
+        if explanation:
+            parts.append(_explanation_html(explanation))
+    parts.append(f"<p><b>Bad row(s) detected this run:</b> {n_quarantined} row(s)</p>")
+    if n_duplicates_skipped:
+        parts.append(
+            f"<p><b>Already-known (duplicate, skipped by dedupe gate):</b> "
+            f"{n_duplicates_skipped} row(s)</p>"
+        )
     if affected_columns:
         cols = ", ".join(str(c) for c in affected_columns) or "—"
         parts.append(f"<p><b>Affected columns:</b> {_html.escape(cols)}</p>")
@@ -497,15 +763,27 @@ def build_recovery_email(
     absent: int = 0,
     count_mismatch_skipped: int = 0,
     dataset_name: str = "",
+    enable_explanation: bool = True,
     bq_updates: list[dict] | None = None,
 ) -> tuple[str, str]:
-    """Summary email when previously-broken rows are recovered and re-loaded."""
+    """Summary email when previously-broken rows are recovered and re-loaded.
+    When `enable_explanation` is true, a best-effort AI plain-language summary
+    is prepended."""
     subject = f"[ETL RECOVERY - {pipeline_name}] {recovered_rows} row(s) recovered"
     parts = []
+    if enable_explanation:
+        explanation = explain_recovery(
+            dataset_name=dataset_name,
+            resolved=resolved,
+            recovered_rows=recovered_rows,
+            absent=absent,
+            count_mismatch_skipped=count_mismatch_skipped,
+        )
+        if explanation:
+            parts.append(_explanation_html(explanation))
     if dataset_name:
         parts.append(f"<p><b>Dataset:</b> {_html.escape(str(dataset_name))}</p>")
     parts += [
-
         f"<p><b>Resolved error entries:</b> {resolved}</p>",
         f"<p><b>Rows re-loaded (path A):</b> {recovered_rows}</p>",
         f"<p><b>Absent (rows removed from sheet):</b> {absent}</p>",
@@ -526,3 +804,50 @@ def build_recovery_email(
         + "</body></html>"
     )
     return subject, body
+
+
+# ---------------------------------------------------------------------------
+# BQ-update summary helpers
+# ---------------------------------------------------------------------------
+
+def bq_full_load(rows: int) -> list[dict]:
+    """BQ-update summary for a run that appended rows to bronze + merged silver."""
+    from src.pesanan_affiliasi.pipelines.config import TGT_BQ_BRONZE, TGT_BQ_SILVER
+    return [
+        {"table": TGT_BQ_BRONZE["entity"], "action": "append", "rows": rows},
+        {"table": TGT_BQ_SILVER["entity"], "action": "MERGE (silver upsert)"},
+    ]
+
+
+def bq_noop() -> list[dict]:
+    """BQ-update summary for a successful run with no new rows to load."""
+    from src.pesanan_affiliasi.pipelines.config import TGT_BQ_BRONZE, TGT_BQ_SILVER
+    return [
+        {"table": TGT_BQ_BRONZE["entity"], "action": "no change", "rows": 0},
+        {"table": TGT_BQ_SILVER["entity"], "action": "no change"},
+    ]
+
+
+def finish(
+    watermark_records,
+    note: str,
+    status: str = "",
+    dry_run: bool = False,
+    run_key: str = "",
+    watermark_updates: dict | None = None,
+    bq_updates: list[dict] | None = None,
+):
+    """Final step on every exit path: show the current watermark, print the
+    ETL DONE line, then send the success alert (skipped in dry-run)."""
+    from src.pesanan_affiliasi.utils.bronze_compare import show_watermark
+
+    show_watermark(watermark_records)
+    print(note)
+    subject, body_html = build_pipeline_success_email(
+        run_key=run_key,
+        log_path=f"logs/run_{run_key}/etl_full_{run_key}.log" if run_key else "",
+        status=status,
+        watermark_updates=watermark_updates,
+        bq_updates=bq_updates,
+    )
+    send_alert_email(subject, body_html, dry_run=dry_run)
