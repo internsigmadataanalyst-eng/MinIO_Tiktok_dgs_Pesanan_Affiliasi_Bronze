@@ -155,6 +155,98 @@ def _error_date_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series("INVALID_DATE", index=df.index)
 
 
+def read_error_manifest(minio_client: Minio, bucket: str, manifest_path: str = ERROR_MANIFEST_PATH) -> tuple[list, bool]:
+    """Reads the error manifest. Returns (open_records, manifest_existed).
+
+    A missing/unreadable-as-absent object yields ([], False) so callers can tell
+    "no manifest yet" from "manifest present but empty". Any other S3Error
+    propagates.
+    """
+    try:
+        minio_client.stat_object(bucket, manifest_path)
+        response = minio_client.get_object(bucket, manifest_path)
+        data = json.loads(response.read().decode("utf-8"))
+        response.close()
+        response.release_conn()
+    except S3Error as e:
+        if e.code in ["NoSuchKey", "AccessDenied"]:
+            return [], False
+        raise e
+    return [r for r in data.get("errors", []) if r.get("status") == "open"], True
+
+
+def _entry_open_since(rec: dict) -> datetime | None:
+    """When this error entry was FIRST reported, parsed. None when unparseable.
+
+    Prefers the preserved `open_since`; falls back to `reported_at` for entries
+    written before `open_since` existed.
+    """
+    raw = rec.get("open_since") or rec.get("reported_at")
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def get_open_error_entries(
+    minio_client: Minio,
+    bucket: str,
+    manifest_path: str = ERROR_MANIFEST_PATH,
+    max_age_days: int | None = None,
+) -> list[dict]:
+    """Open error-manifest entries, oldest first.
+
+    Each returned dict gains a computed `age_days` key (float). When
+    `max_age_days` is not None, only entries whose age is <= max_age_days are
+    returned — this bounds how long a stuck entry can hold the pre-flight gate
+    open. Entries with no parseable `open_since`/`reported_at` are treated as
+    fresh (age 0) so a malformed timestamp can never silently expire a real
+    defect; they age out on the next sync once `open_since` is written.
+    """
+    open_records, _ = read_error_manifest(minio_client, bucket, manifest_path)
+    if not open_records:
+        return []
+
+    now = datetime.now()
+    out = []
+    for rec in open_records:
+        rec = dict(rec)
+        since = _entry_open_since(rec)
+        age_days = 0.0 if since is None else (now - since).total_seconds() / 86400.0
+        rec["age_days"] = round(age_days, 2)
+        if max_age_days is None or age_days <= max_age_days:
+            out.append(rec)
+
+    out.sort(key=lambda r: (-r["age_days"], str(r.get("sheet_name")), str(r.get("error_date"))))
+    return out
+
+
+def _signature(entry: dict) -> tuple:
+    """Change-detection signature of a manifest entry: (n_rows, error_reasons).
+
+    Two detections of the same group are "the same defect" only when both the
+    bad-row count AND the set of error reasons are unchanged. Any difference
+    means the defect changed shape -- e.g. the owner fixed some of the bad rows,
+    or the corruption moved to a different column. That is a recovery signal in
+    its own right, and is what lets PATH A re-admit a partially fixed group
+    instead of deadlocking it forever behind a strict count-equality test.
+
+    `error_reasons` is a list of the raw per-row `error_reason` cells (see
+    sync_error_manifest), each of which is a '|'-joined combination of the six
+    reason codes. Comparing those strings verbatim is intentional: it is more
+    sensitive than comparing the flattened token set, so a row whose reason
+    combination changes is detected as a changed defect.
+    """
+    try:
+        n_rows = int(entry.get("n_rows") or 0)
+    except (TypeError, ValueError):
+        n_rows = 0
+    reasons = tuple(sorted(str(r) for r in (entry.get("error_reasons") or [])))
+    return (n_rows, reasons)
+
+
 def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.DataFrame, manifest_path: str = ERROR_MANIFEST_PATH) -> pd.DataFrame:
     """Dedupe gate BEFORE writing quarantine: drops already-quarantined bad rows.
 
@@ -170,17 +262,7 @@ def filter_already_quarantined(minio_client: Minio, bucket: str, df_error: pd.Da
     if df_error is None or df_error.empty:
         return df_error
 
-    try:
-        minio_client.stat_object(bucket, manifest_path)
-        response = minio_client.get_object(bucket, manifest_path)
-        data = json.loads(response.read().decode("utf-8"))
-        response.close()
-        response.release_conn()
-        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
-    except S3Error as e:
-        if e.code in ["NoSuchKey", "AccessDenied"]:
-            return df_error
-        raise e
+    open_records, _ = read_error_manifest(minio_client, bucket, manifest_path)
 
     known = {}
     for rec in open_records:
@@ -348,8 +430,16 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
       5. Writes the manifest back only if something changed (avoids creating
          an empty file when there is nothing to do).
 
-    Returns the list of confirmed resolved entries (sheet_name, creds, toko, error_date)
-    so callers can re-load the recovered rows via PATH A (bypassing the watermark).
+    Returns (resolved, readmit) — the two kinds of group whose VALID rows must be
+    re-loaded via PATH A (bypassing the watermark):
+
+      resolved : no longer detected this run AND proven recovered
+      readmit  : STILL detected, but whose signature (n_rows, error_reasons)
+                 changed — some bad rows were fixed, or the defect changed shape
+
+    `open_since` is carried over from the previous entry so the age of a stuck
+    defect keeps growing; without it, reported_at alone would refresh daily and
+    the pre-flight recovery gate could never expire the entry.
     """
     if df_valid is None:
         df_valid = df_error.iloc[0:0]
@@ -406,20 +496,9 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
                 "status": "open",
             })
 
-    manifest_existed = True
-    try:
-        minio_client.stat_object(bucket, manifest_path)
-        response = minio_client.get_object(bucket, manifest_path)
-        data = json.loads(response.read().decode("utf-8"))
-        response.close()
-        response.release_conn()
-        open_records = [r for r in data.get("errors", []) if r.get("status") == "open"]
-    except S3Error as e:
-        if e.code in ["NoSuchKey", "AccessDenied"]:
-            open_records = []
-            manifest_existed = False
-        else:
-            raise e
+    open_records, manifest_existed = read_error_manifest(
+        minio_client, bucket, manifest_path
+    )
 
     current_keys = {(e["sheet_name"], e["creds"], e.get("toko") or "", e["error_date"]) for e in current_entries}
 
@@ -456,8 +535,17 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
 
     # Fresh current-run entries always win: refresh n_rows / affected_columns /
     # reported_at / path for keys that already exist, append brand-new keys.
+    # `open_since` is carried over from the previous entry so the age of a stuck
+    # defect keeps growing; without it, reported_at alone would refresh daily
+    # and the pre-flight recovery gate could never expire the entry.
+    readmit = []
     for entry in current_entries:
-        refreshed[(entry["sheet_name"], entry["creds"], entry["toko"], entry["error_date"])] = entry
+        key = (entry["sheet_name"], entry["creds"], entry["toko"], entry["error_date"])
+        prev = refreshed.get(key)
+        entry["open_since"] = (prev or {}).get("open_since") or now
+        if prev is not None and _signature(prev) != _signature(entry):
+            readmit.append(entry)
+        refreshed[key] = entry
 
     remaining = list(refreshed.values())
 
@@ -467,7 +555,7 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
     old_payload = json.dumps({"errors": open_records}, ensure_ascii=False, sort_keys=True)
     changed = bool(resolved) or new_payload != old_payload
     if not changed and not manifest_existed:
-        return []
+        return [], []
 
     if resolved:
         fix_folder = f"{FIX_MANIFEST_PREFIX}/date={today_key}/"
@@ -513,7 +601,9 @@ def sync_error_manifest(minio_client: Minio, bucket: str, df_error: pd.DataFrame
         )
         if current_entries:
             print(f"[MINIO] Synced {len(current_entries)} open error entr(y/ies) to {manifest_path}")
-    return resolved
+    if readmit:
+        print(f"[MINIO] {len(readmit)} error entr(y/ies) changed signature -> PATH A re-admit")
+    return resolved, readmit
 
 
 def filter_by_sheet_watermark(df: pd.DataFrame, creds_col: str, sheet_name_col: str, toko_col: str, date_col: str, watermarks: dict) -> tuple[pd.DataFrame, dict]:

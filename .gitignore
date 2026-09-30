@@ -10,6 +10,7 @@ scripts/
 # Testing
 PLANNING_STAGE.md
 tests/
+verify_quarantine_v2.py
 
 # ETL logs
 logs/

@@ -480,7 +480,7 @@ def cap_watermark_advance_at_low_volume(
     to such a date pins the sheet max there and, worse, silently drops the
     genuine rows for that date that arrive late. This rule never advances the
     watermark past the first below-band volume date after the previous
-    watermark, so the sheet stays "behind", the gate keeps passing, and late
+    watermark, so the sheet stays "needs_update", the gate keeps passing, and late
     genuine rows are re-pulled (hash idempotency dedup absorbs the early rows).
 
     Every toko's volume signature is store-specific (some process 1-3 rows/day,

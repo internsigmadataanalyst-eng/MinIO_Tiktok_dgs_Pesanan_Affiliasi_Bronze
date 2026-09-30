@@ -5,8 +5,18 @@ Compares the live GSheet state against the stored MinIO watermark to decide
 whether each sheet has new data worth processing.
 
 Gate rule: every sheet must have at least 1 toko group where live tanggal >
-watermark date. If any sheet has 0 toko groups behind (or an access error),
+watermark date. If any sheet has 0 toko groups needing update (or an access error),
 the ETL aborts.
+
+Sheets listed in config.WHITELIST_SHEETS are allowed to lag: they are reported as
+whitelisted_skipped instead of aborting the run.
+
+The gate is ALSO recovery-aware, applied by run_daily_etl rather than here: an
+open entry in the error manifest counts as outstanding work for its
+(sheet_name, toko) group, so a sheet whose only remaining work is a repaired
+quarantine group is not mistaken for "caught up" and aborted before PATH A can
+re-admit it. The gate implementation lives in run_daily_etl, which folds
+recovery_pending into the status_df this module returns.
 """
 import os
 from datetime import datetime
@@ -180,7 +190,7 @@ def compare_watermark_vs_sheet(
 
     Returns a DataFrame with columns:
         sheet_name, grain, logical_sheet, sheet_max_tanggal, n_future_rows,
-        last_processed_date, is_behind, status
+        last_processed_date, needs_update, status
     """
     if spreadsheet_objects is None:
         spreadsheet_objects = _open_spreadsheets(sheet_registry)
@@ -191,7 +201,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "n_future_rows": None, "last_processed_date": None,
-                "is_behind": False, "status": "registry_key not found in sheet_registry",
+                "needs_update": False, "status": "registry_key not found in sheet_registry",
             })
             continue
 
@@ -201,7 +211,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "n_future_rows": None, "last_processed_date": None,
-                "is_behind": False, "status": "spreadsheet object not found",
+                "needs_update": False, "status": "spreadsheet object not found",
             })
             continue
 
@@ -221,7 +231,7 @@ def compare_watermark_vs_sheet(
             rows.append({
                 "sheet_name": registry_key, "grain": None, "logical_sheet": logical_name,
                 "sheet_max_tanggal": None, "n_future_rows": None, "last_processed_date": None,
-                "is_behind": False, "status": f"error: {e}",
+                "needs_update": False, "status": f"error: {e}",
             })
             continue
 
@@ -239,7 +249,7 @@ def compare_watermark_vs_sheet(
                 "sheet_max_tanggal": sheet_max,
                 "n_future_rows": n_future,
                 "last_processed_date": last_processed,
-                "is_behind": bool(pd.notna(sheet_max) and sheet_max > last_processed),
+                "needs_update": bool(pd.notna(sheet_max) and sheet_max > last_processed),
                 "status": (
                     "ok"
                     if pd.notna(sheet_max)
@@ -248,8 +258,8 @@ def compare_watermark_vs_sheet(
             })
 
     df_out = pd.DataFrame(rows)
-    if "is_behind" not in df_out.columns:
-        df_out["is_behind"] = pd.Series(dtype=bool)
+    if "needs_update" not in df_out.columns:
+        df_out["needs_update"] = pd.Series(dtype=bool)
     return df_out
 
 
